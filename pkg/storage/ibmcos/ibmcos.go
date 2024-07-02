@@ -18,6 +18,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
 
+	"github.com/IBM-Cloud/ibm-cloud-cli-sdk/bluemix/crn"
 	"github.com/IBM/go-sdk-core/v5/core"
 	"github.com/IBM/ibm-cos-sdk-go/aws"
 	"github.com/IBM/ibm-cos-sdk-go/aws/awserr"
@@ -27,6 +28,7 @@ import (
 	"github.com/IBM/ibm-cos-sdk-go/aws/session"
 	"github.com/IBM/ibm-cos-sdk-go/service/s3"
 	"github.com/IBM/ibm-cos-sdk-go/service/s3/s3manager"
+	"github.com/IBM/platform-services-go-sdk/globalcatalogv1"
 	"github.com/IBM/platform-services-go-sdk/resourcecontrollerv2"
 	"github.com/IBM/platform-services-go-sdk/resourcemanagerv2"
 	"github.com/golang-jwt/jwt"
@@ -50,7 +52,16 @@ const (
 	// IAMEndpoint is the default IAM token endpoint
 	IAMEndpoint = "https://iam.cloud.ibm.com/identity/token"
 
-	cosEndpointTemplate           = "s3.%s.cloud-object-storage.appdomain.cloud"
+	cosEndpointTemplate = "s3.%s.cloud-object-storage.appdomain.cloud"
+
+	// Consts used to lookup COS Service details in the IBM Cloud Global Catalog
+	cosServiceName     = "cloud-object-storage"
+	cosServicePlanName = "standard"
+
+	// Consts used as fallback (default) COS Service details (if they cannot be retrieved from the IBM Cloud Global Catalog)
+	defaultCOSServicePlanID = "744bfc56-d12c-4866-88d5-dac9139e0e5d"
+	defaultCOSServiceTarget = "bluemix-global"
+
 	imageRegistrySecretDataKey    = "credentials"
 	imageRegistrySecretMountpoint = "/var/run/secrets/cloud"
 )
@@ -71,6 +82,7 @@ type driver struct {
 	// Endpoints to use for IBM Cloud Services
 	iamServiceEndpoint string
 	cosServiceEndpoint string
+	gcServiceEndpoint  string
 	rcServiceEndpoint  string
 	rmServiceEndpoint  string
 }
@@ -270,9 +282,11 @@ func (d *driver) CreateStorage(cr *imageregistryv1.Config) error {
 
 		// Define instance options
 		serviceInstanceName := fmt.Sprintf("%s-%s", infra.Status.InfrastructureName, defaults.ImageRegistryName)
-		serviceTarget := "bluemix-global"
+
+		// Get the Service Plan ID and Target for COS
+		resourcePlanID, serviceTarget := d.getCOSServicePlanAndTarget()
+
 		resourceGroupID := *resourceGroups.Resources[0].ID
-		resourcePlanID := "744bfc56-d12c-4866-88d5-dac9139e0e5d"
 
 		// Check if service instance with name already exists
 		instances, resp, err := rc.ListResourceInstancesWithContext(
@@ -484,13 +498,16 @@ func (d *driver) setServiceEndpointOverrides(infra *configapiv1.Infrastructure) 
 					case configapiv1.IBMCloudServiceIAM:
 						klog.Infof("found override for ibmcloud iam endpoint: %s", endpoint.URL)
 						d.iamServiceEndpoint = endpoint.URL
+					case configapiv1.IBMCloudServiceGlobalCatalog:
+						klog.Infof("found override for ibmcloud global catalog endpoint: %s", endpoint.URL)
+						d.gcServiceEndpoint = endpoint.URL
 					case configapiv1.IBMCloudServiceResourceController:
 						klog.Infof("found override for ibmcloud resource controller endpoint: %s", endpoint.URL)
 						d.rcServiceEndpoint = endpoint.URL
 					case configapiv1.IBMCloudServiceResourceManager:
 						klog.Infof("found override for ibmcloud resource manager endpoint: %s", endpoint.URL)
 						d.rmServiceEndpoint = endpoint.URL
-					case configapiv1.IBMCloudServiceCIS, configapiv1.IBMCloudServiceDNSServices, configapiv1.IBMCloudServiceGlobalSearch, configapiv1.IBMCloudServiceGlobalTagging, configapiv1.IBMCloudServiceHyperProtect, configapiv1.IBMCloudServiceKeyProtect, configapiv1.IBMCloudServiceVPC, configapiv1.IBMCloudServiceCOSConfig, configapiv1.IBMCloudServiceGlobalCatalog:
+					case configapiv1.IBMCloudServiceCIS, configapiv1.IBMCloudServiceDNSServices, configapiv1.IBMCloudServiceGlobalSearch, configapiv1.IBMCloudServiceGlobalTagging, configapiv1.IBMCloudServiceHyperProtect, configapiv1.IBMCloudServiceKeyProtect, configapiv1.IBMCloudServiceVPC, configapiv1.IBMCloudServiceCOSConfig:
 						klog.Infof("ignoring unused service endpoint: %s", endpoint.Name)
 					default:
 						klog.Infof("ignoring unknown service: %s", endpoint.Name)
@@ -507,13 +524,16 @@ func (d *driver) setServiceEndpointOverrides(infra *configapiv1.Infrastructure) 
 					case strings.ToLower(string(configapiv1.IBMCloudServiceIAM)):
 						klog.Infof("found override for ibmcloud iam endpoint: %s", endpoint.URL)
 						d.iamServiceEndpoint = endpoint.URL
+					case strings.ToLower(string(configapiv1.IBMCloudServiceGlobalCatalog)):
+						klog.Infof("found override for ibmcloud global catalog: %s", endpoint.URL)
+						d.gcServiceEndpoint = endpoint.URL
 					case strings.ToLower(string(configapiv1.IBMCloudServiceResourceController)):
 						klog.Infof("found override for ibmcloud resource controller endpoint: %s", endpoint.URL)
 						d.rcServiceEndpoint = endpoint.URL
 					case strings.ToLower(string(configapiv1.IBMCloudServiceResourceManager)):
 						klog.Infof("found override for ibmcloud resource manager endpoint: %s", endpoint.URL)
 						d.rmServiceEndpoint = endpoint.URL
-					case strings.ToLower(string(configapiv1.IBMCloudServiceCIS)), strings.ToLower(string(configapiv1.IBMCloudServiceDNSServices)), strings.ToLower(string(configapiv1.IBMCloudServiceGlobalSearch)), strings.ToLower(string(configapiv1.IBMCloudServiceGlobalTagging)), strings.ToLower(string(configapiv1.IBMCloudServiceHyperProtect)), strings.ToLower(string(configapiv1.IBMCloudServiceKeyProtect)), strings.ToLower(string(configapiv1.IBMCloudServiceVPC)), strings.ToLower(string(configapiv1.IBMCloudServiceCOSConfig)), strings.ToLower(string(configapiv1.IBMCloudServiceGlobalCatalog)):
+					case strings.ToLower(string(configapiv1.IBMCloudServiceCIS)), strings.ToLower(string(configapiv1.IBMCloudServiceDNSServices)), strings.ToLower(string(configapiv1.IBMCloudServiceGlobalSearch)), strings.ToLower(string(configapiv1.IBMCloudServiceGlobalTagging)), strings.ToLower(string(configapiv1.IBMCloudServiceHyperProtect)), strings.ToLower(string(configapiv1.IBMCloudServiceKeyProtect)), strings.ToLower(string(configapiv1.IBMCloudServiceVPC)), strings.ToLower(string(configapiv1.IBMCloudServiceCOSConfig)):
 						klog.Infof("ignoring unused service endpoint: %s", endpoint.Name)
 					default:
 						klog.Infof("ignoring unknown service: %s", endpoint.Name)
@@ -566,6 +586,108 @@ func (d *driver) getAccountID() (string, error) {
 	}
 
 	return accountID, nil
+}
+
+// getCOSServicePlanAndTarget returns the IBM Cloud Global Catalog service plan ID and target for COS.
+// If there is a failure during the Global Catalog lookup, we fallback to using a default ID and Target.
+func (d *driver) getCOSServicePlanAndTarget() (string, string) {
+	// Fetch the latest Infrastructure Status, for any endpoint changes
+	infra, err := util.GetInfrastructure(d.Listers.Infrastructures)
+	if err != nil {
+		return defaultCOSServicePlanID, defaultCOSServiceTarget
+	}
+	d.setServiceEndpointOverrides(infra)
+
+	IAMAPIKey, err := d.getCredentialsConfigData()
+	if err != nil {
+		return defaultCOSServicePlanID, defaultCOSServiceTarget
+	}
+
+	authenticator := &core.IamAuthenticator{
+		ApiKey: IAMAPIKey,
+	}
+	if d.iamServiceEndpoint != "" {
+		authenticator.URL = d.iamServiceEndpoint
+	}
+
+	gcOptions := &globalcatalogv1.GlobalCatalogV1Options{
+		Authenticator: authenticator,
+	}
+	if d.gcServiceEndpoint != "" {
+		gcOptions.URL = d.gcServiceEndpoint
+	}
+
+	catalogService, err := globalcatalogv1.NewGlobalCatalogV1(gcOptions)
+	if err != nil {
+		return defaultCOSServicePlanID, defaultCOSServiceTarget
+	}
+
+	// Function will get the Service Plan ID and Target for the COS Standard Plan
+	getServicePlanAndTarget := func(serviceID string, servicePlanName string) (string, string, error) {
+		childOptions := catalogService.NewGetChildObjectsOptions(serviceID, "plan")
+		result, detailedResponse, err := catalogService.GetChildObjects(childOptions)
+		if err != nil {
+			return "", "", err
+		} else if detailedResponse != nil && detailedResponse.GetStatusCode() == http.StatusNotFound {
+			return "", "", fmt.Errorf("cannot find cos service plan")
+		}
+
+		var planID *string
+		for _, entry := range result.Resources {
+			if *entry.Name == servicePlanName {
+				planID = entry.ID
+				break
+			}
+		}
+
+		if planID != nil {
+			// Once finding the COS Standard Plan, we must retrieve the Target from its child's deployment
+			childOptions := catalogService.NewGetChildObjectsOptions(*planID, "deployment")
+			childResult, detailedResponse, err := catalogService.GetChildObjects(childOptions)
+			if err != nil {
+				return "", "", err
+			} else if detailedResponse != nil && detailedResponse.GetStatusCode() == http.StatusNotFound {
+				return "", "", fmt.Errorf("cannot find cos service target")
+			}
+
+			for _, childEntry := range childResult.Resources {
+				// NOTE(cjschaef): At this time all deployments of the Standard Plan have the same Target, so any deployment will do
+				if childEntry.Metadata != nil && childEntry.Metadata.Deployment != nil && childEntry.Metadata.Deployment.TargetCRN != nil {
+					serviceCRN, err := crn.Parse(*childEntry.Metadata.Deployment.TargetCRN)
+					if err != nil {
+						return "", "", fmt.Errorf("failed parsing target from deployment target crn")
+					}
+					// Return the Standard Plan ID and the CRN's Resource for the Target
+					return *planID, serviceCRN.Resource, nil
+				}
+			}
+
+			return "", "", fmt.Errorf("could not find a deployment with a target")
+		}
+
+		return "", "", fmt.Errorf("could not find cos standard plan id")
+	}
+
+	listOptions := catalogService.NewListCatalogEntriesOptions().SetQ(cosServiceName)
+	result, detailedResponse, err := catalogService.ListCatalogEntries(listOptions)
+	if err != nil {
+		// Any errors, return the default ID and target
+		return defaultCOSServicePlanID, defaultCOSServiceTarget
+	} else if detailedResponse != nil && detailedResponse.GetStatusCode() == http.StatusNotFound {
+		return defaultCOSServicePlanID, defaultCOSServiceTarget
+	}
+
+	for _, service := range result.Resources {
+		if cosServiceName == *service.Name {
+			servicePlanID, serviceTarget, err := getServicePlanAndTarget(*service.ID, cosServicePlanName)
+			if err != nil {
+				return defaultCOSServicePlanID, defaultCOSServiceTarget
+			}
+			return servicePlanID, serviceTarget
+		}
+	}
+
+	return defaultCOSServicePlanID, defaultCOSServiceTarget
 }
 
 // getResourceControllerService returns the IBM Cloud resource controller client.
