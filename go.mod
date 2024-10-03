@@ -1,6 +1,8 @@
 module github.com/openshift/cluster-image-registry-operator
 
-go 1.22.0
+go 1.22.3
+
+toolchain go1.22.5
 
 require (
 	cloud.google.com/go/resourcemanager v1.9.6
@@ -17,6 +19,7 @@ require (
 	github.com/Azure/go-autorest/autorest v0.11.29
 	github.com/Azure/go-autorest/autorest/mocks v0.4.2
 	github.com/Azure/go-autorest/autorest/to v0.4.0
+	github.com/IBM-Cloud/ibm-cloud-cli-sdk v1.5.0
 	github.com/IBM/go-sdk-core/v5 v5.14.1
 	github.com/IBM/ibm-cos-sdk-go v1.10.0
 	github.com/IBM/platform-services-go-sdk v0.55.0
