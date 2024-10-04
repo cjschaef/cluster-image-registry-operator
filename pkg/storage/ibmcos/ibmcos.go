@@ -55,8 +55,9 @@ const (
 	cosEndpointTemplate = "s3.%s.cloud-object-storage.appdomain.cloud"
 
 	// Consts used to lookup COS Service details in the IBM Cloud Global Catalog
-	cosServiceName     = "cloud-object-storage"
-	cosServicePlanName = "standard"
+	cosServiceName                = "cloud-object-storage"
+	cosServicePlanName            = "standard"
+	objectStorageGroupServiceName = "object-storage-group"
 
 	// Consts used as fallback (default) COS Service details (if they cannot be retrieved from the IBM Cloud Global Catalog)
 	defaultCOSServicePlanID = "744bfc56-d12c-4866-88d5-dac9139e0e5d"
@@ -284,6 +285,7 @@ func (d *driver) CreateStorage(cr *imageregistryv1.Config) error {
 		serviceInstanceName := fmt.Sprintf("%s-%s", infra.Status.InfrastructureName, defaults.ImageRegistryName)
 
 		// Get the Service Plan ID and Target for COS
+		klog.Info("collecting cos service plan id and target")
 		resourcePlanID, serviceTarget := d.getCOSServicePlanAndTarget()
 
 		resourceGroupID := *resourceGroups.Resources[0].ID
@@ -594,12 +596,14 @@ func (d *driver) getCOSServicePlanAndTarget() (string, string) {
 	// Fetch the latest Infrastructure Status, for any endpoint changes
 	infra, err := util.GetInfrastructure(d.Listers.Infrastructures)
 	if err != nil {
+		klog.Info("error retrieving infrastructure status, defaulting COS service plan and target")
 		return defaultCOSServicePlanID, defaultCOSServiceTarget
 	}
 	d.setServiceEndpointOverrides(infra)
 
 	IAMAPIKey, err := d.getCredentialsConfigData()
 	if err != nil {
+		klog.Info("error retrieving IAM apikey, defaulting COS service plan and target")
 		return defaultCOSServicePlanID, defaultCOSServiceTarget
 	}
 
@@ -619,6 +623,7 @@ func (d *driver) getCOSServicePlanAndTarget() (string, string) {
 
 	catalogService, err := globalcatalogv1.NewGlobalCatalogV1(gcOptions)
 	if err != nil {
+		klog.Info("error retrieving catalog service, defaulting COS service plan and target")
 		return defaultCOSServicePlanID, defaultCOSServiceTarget
 	}
 
@@ -633,8 +638,11 @@ func (d *driver) getCOSServicePlanAndTarget() (string, string) {
 		}
 
 		var planID *string
+		klog.Info(fmt.Sprintf("checking %d resources for service plan", len(result.Resources)))
 		for _, entry := range result.Resources {
+			klog.Info(fmt.Sprintf("checking entry: %s", *entry.Name))
 			if *entry.Name == servicePlanName {
+				klog.Info(fmt.Sprintf("found service plan entry: %s", servicePlanName))
 				planID = entry.ID
 				break
 			}
@@ -642,7 +650,9 @@ func (d *driver) getCOSServicePlanAndTarget() (string, string) {
 
 		if planID != nil {
 			// Once finding the COS Standard Plan, we must retrieve the Target from its child's deployment
+			klog.Info(fmt.Sprintf("checking deployments for plan: %s", *planID))
 			childOptions := catalogService.NewGetChildObjectsOptions(*planID, "deployment")
+			childOptions.SetComplete(true)
 			childResult, detailedResponse, err := catalogService.GetChildObjects(childOptions)
 			if err != nil {
 				return "", "", err
@@ -650,14 +660,17 @@ func (d *driver) getCOSServicePlanAndTarget() (string, string) {
 				return "", "", fmt.Errorf("cannot find cos service target")
 			}
 
+			klog.Info(fmt.Sprintf("checking %d resources for target crn", len(childResult.Resources)))
 			for _, childEntry := range childResult.Resources {
-				// NOTE(cjschaef): At this time all deployments of the Standard Plan have the same Target, so any deployment will do
+				// NOTE(cjschaef): At this time all deployments of the 'Standard Plan' have the same Target, so any deployment will do
 				if childEntry.Metadata != nil && childEntry.Metadata.Deployment != nil && childEntry.Metadata.Deployment.TargetCRN != nil {
+					klog.Info(fmt.Sprintf("parsing target crn for service: %s", *childEntry.Metadata.Deployment.TargetCRN))
 					serviceCRN, err := crn.Parse(*childEntry.Metadata.Deployment.TargetCRN)
 					if err != nil {
 						return "", "", fmt.Errorf("failed parsing target from deployment target crn")
 					}
-					// Return the Standard Plan ID and the CRN's Resource for the Target
+					// Return the Plan ID and the CRN's Resource for the Target
+					klog.Info(fmt.Sprintf("found id and target for cos: %s - %s", *planID, serviceCRN.Resource))
 					return *planID, serviceCRN.Resource, nil
 				}
 			}
@@ -668,25 +681,34 @@ func (d *driver) getCOSServicePlanAndTarget() (string, string) {
 		return "", "", fmt.Errorf("could not find cos standard plan id")
 	}
 
-	listOptions := catalogService.NewListCatalogEntriesOptions().SetQ(cosServiceName)
-	result, detailedResponse, err := catalogService.ListCatalogEntries(listOptions)
+	// COS is provided under the object-storage-group catalog entry, so start there. Wildcard gets all child types.
+	childOptions := catalogService.NewGetChildObjectsOptions(objectStorageGroupServiceName, "*")
+	childOptions.SetComplete(true)
+	result, detailedResponse, err := catalogService.GetChildObjects(childOptions)
 	if err != nil {
 		// Any errors, return the default ID and target
+		klog.Info("error retrieving object-storage-group catalog service entry, defaulting COS service plan and target")
 		return defaultCOSServicePlanID, defaultCOSServiceTarget
 	} else if detailedResponse != nil && detailedResponse.GetStatusCode() == http.StatusNotFound {
+		klog.Info("failed to find object-storage-group catalog service entry, defaulting COS service plan and target")
 		return defaultCOSServicePlanID, defaultCOSServiceTarget
 	}
 
+	klog.Info(fmt.Sprintf("checking %d child resources for cos service", len(result.Resources)))
 	for _, service := range result.Resources {
+		// Find the COS child service.
 		if cosServiceName == *service.Name {
+			klog.Info("found cos child service, checking for plan and target")
 			servicePlanID, serviceTarget, err := getServicePlanAndTarget(*service.ID, cosServicePlanName)
 			if err != nil {
+				klog.Info("error retrieving COS plan and target, defaulting COS service plan and target")
 				return defaultCOSServicePlanID, defaultCOSServiceTarget
 			}
 			return servicePlanID, serviceTarget
 		}
 	}
 
+	klog.Info("no COS service plan or target found, defaulting COS service plan and target")
 	return defaultCOSServicePlanID, defaultCOSServiceTarget
 }
 
